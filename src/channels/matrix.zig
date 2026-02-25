@@ -394,10 +394,86 @@ pub const MatrixChannel = struct {
                 const content_val = event.object.get("content") orelse continue;
                 if (content_val != .object) continue;
 
-                const body_val = content_val.object.get("body") orelse continue;
-                if (body_val != .string) continue;
-                const body = std.mem.trim(u8, body_val.string, " \t\r\n");
-                if (body.len == 0) continue;
+                // Extract body text (may be absent for some media messages)
+                const body_raw: []const u8 = if (content_val.object.get("body")) |bv|
+                    (if (bv == .string) bv.string else "")
+                else
+                    "";
+                const body = std.mem.trim(u8, body_raw, " \t\r\n");
+
+                // Check msgtype for media messages
+                const msgtype: []const u8 = if (content_val.object.get("msgtype")) |mt|
+                    (if (mt == .string) mt.string else "m.text")
+                else
+                    "m.text";
+
+                const is_media = std.mem.eql(u8, msgtype, "m.image") or
+                    std.mem.eql(u8, msgtype, "m.file") or
+                    std.mem.eql(u8, msgtype, "m.video") or
+                    std.mem.eql(u8, msgtype, "m.audio");
+
+                // Skip if no body and no media
+                if (body.len == 0 and !is_media) continue;
+
+                // Build final content: body + downloaded media
+                var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer content_buf.deinit(allocator);
+
+                if (body.len > 0) {
+                    content_buf.appendSlice(allocator, body) catch {};
+                }
+
+                if (is_media) {
+                    if (content_val.object.get("url")) |url_val| {
+                        if (url_val == .string) {
+                            const mxc_url = url_val.string;
+                            // Download mxc:// URL
+                            if (mxcToHttpUrl(allocator, self.homeserver, mxc_url)) |download_url| {
+                                defer allocator.free(download_url);
+
+                                if (!builtin.is_test) {
+                                    const auth_hdr = self.authHeader(allocator) catch null;
+                                    defer if (auth_hdr) |h| allocator.free(h);
+                                    const hdrs: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+
+                                    if (root.http_util.curlGet(allocator, download_url, hdrs, "30")) |data| {
+                                        defer allocator.free(data);
+
+                                        const rand = std.crypto.random;
+                                        const rand_id = rand.int(u64);
+                                        var path_buf: [1024]u8 = undefined;
+                                        const local_path = std.fmt.bufPrint(&path_buf, "/tmp/matrix_{x}.dat", .{rand_id}) catch "";
+
+                                        if (local_path.len > 0) {
+                                            if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+                                                file.writeAll(data) catch {
+                                                    file.close();
+                                                };
+                                                file.close();
+
+                                                const tag = if (std.mem.eql(u8, msgtype, "m.image")) "[IMAGE:" else "[FILE:";
+                                                if (content_buf.items.len > 0) content_buf.appendSlice(allocator, "\n") catch {};
+                                                content_buf.appendSlice(allocator, tag) catch {};
+                                                content_buf.appendSlice(allocator, local_path) catch {};
+                                                content_buf.appendSlice(allocator, "]") catch {};
+                                            } else |_| {}
+                                        }
+                                    } else |_| {}
+                                } else {
+                                    // In tests, just append the mxc URL as a tag
+                                    const tag = if (std.mem.eql(u8, msgtype, "m.image")) "[IMAGE:" else "[FILE:";
+                                    if (content_buf.items.len > 0) content_buf.appendSlice(allocator, "\n") catch {};
+                                    content_buf.appendSlice(allocator, tag) catch {};
+                                    content_buf.appendSlice(allocator, mxc_url) catch {};
+                                    content_buf.appendSlice(allocator, "]") catch {};
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Skip if we ended up with nothing
+                if (content_buf.items.len == 0) continue;
 
                 const event_id: []const u8 = blk: {
                     if (event.object.get("event_id")) |eid| {
@@ -415,10 +491,13 @@ pub const MatrixChannel = struct {
                     break :blk root.nowEpochSecs();
                 };
 
+                const final_content = content_buf.toOwnedSlice(allocator) catch
+                    try allocator.dupe(u8, body);
+
                 try out.append(allocator, .{
                     .id = try allocator.dupe(u8, event_id),
                     .sender = try allocator.dupe(u8, sender),
-                    .content = try allocator.dupe(u8, body),
+                    .content = final_content,
                     .channel = "matrix",
                     .timestamp = timestamp,
                     .reply_target = try allocator.dupe(u8, room_id),
@@ -467,8 +546,79 @@ pub const MatrixChannel = struct {
             try self.sendMessage(target, message);
         }
 
-        for (media) |item| {
-            try self.sendMessage(target, item);
+        for (media) |file_path| {
+            self.sendFileMessage(target, file_path) catch |err| {
+                log.warn("Matrix: sendFileMessage failed: {}", .{err});
+                // Fallback: send file path as text
+                self.sendMessage(target, file_path) catch {};
+            };
+        }
+    }
+
+    /// Upload a file to Matrix media repo and send an m.image or m.file message.
+    fn sendFileMessage(self: *MatrixChannel, target: []const u8, file_path: []const u8) !void {
+        const room_id = self.normalizeTargetRoom(target) orelse return error.InvalidTarget;
+        const http_util = @import("../http_util.zig");
+
+        // Determine content type and msgtype
+        const content_type = http_util.guessContentType(file_path);
+        const is_image = std.mem.startsWith(u8, content_type, "image/");
+        const msgtype = if (is_image) "m.image" else "m.file";
+
+        // Extract filename from path
+        const filename = std.fs.path.basename(file_path);
+
+        // Build upload URL: POST /_matrix/media/v3/upload?filename=<name>
+        var upload_url_buf: [4096]u8 = undefined;
+        var upload_fbs = std.io.fixedBufferStream(&upload_url_buf);
+        const uw = upload_fbs.writer();
+        try uw.writeAll(self.homeserver);
+        try uw.writeAll("/_matrix/media/v3/upload?filename=");
+        try appendUrlEncoded(uw, filename);
+        const upload_url = upload_fbs.getWritten();
+
+        // Auth header
+        const auth_header = try self.authHeader(self.allocator);
+        defer self.allocator.free(auth_header);
+
+        // Upload file
+        const upload_resp = try http_util.curlPostFile(
+            self.allocator,
+            upload_url,
+            file_path,
+            content_type,
+            &.{auth_header},
+        );
+        defer self.allocator.free(upload_resp);
+
+        // Parse mxc:// URL from response: {"content_uri":"mxc://..."}
+        const mxc_url = extractMxcUrl(self.allocator, upload_resp) orelse return error.MatrixUploadFailed;
+        defer self.allocator.free(mxc_url);
+
+        // Send m.image or m.file message
+        var txn_buf: [256]u8 = undefined;
+        const txn_id = try self.nextTxnId(&txn_buf);
+
+        var url_buf: [2048]u8 = undefined;
+        const send_url = try self.buildSendUrl(&url_buf, room_id, txn_id);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
+        try w.writeAll("{\"msgtype\":\"");
+        try w.writeAll(msgtype);
+        try w.writeAll("\",\"body\":");
+        try root.appendJsonStringW(w, filename);
+        try w.writeAll(",\"url\":");
+        try root.appendJsonStringW(w, mxc_url);
+        try w.writeAll("}");
+
+        const headers = [_][]const u8{auth_header};
+        const resp = try root.http_util.curlPost(self.allocator, send_url, body_list.items, &headers);
+        defer self.allocator.free(resp);
+
+        if (std.mem.indexOf(u8, resp, "\"event_id\"") == null) {
+            return error.MatrixSendFailed;
         }
     }
 
@@ -494,6 +644,33 @@ pub const MatrixChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+/// Convert mxc://server/media_id to an HTTP download URL.
+/// Returns allocated string or null if the URL is not a valid mxc:// URL.
+fn mxcToHttpUrl(allocator: std.mem.Allocator, homeserver: []const u8, mxc_url: []const u8) ?[]u8 {
+    // mxc://server_name/media_id
+    if (!std.mem.startsWith(u8, mxc_url, "mxc://")) return null;
+    const rest = mxc_url[6..]; // after "mxc://"
+    const slash_pos = std.mem.indexOf(u8, rest, "/") orelse return null;
+    const server = rest[0..slash_pos];
+    const media_id = rest[slash_pos + 1 ..];
+    if (server.len == 0 or media_id.len == 0) return null;
+
+    return std.fmt.allocPrint(allocator, "{s}/_matrix/media/v3/download/{s}/{s}", .{
+        homeserver, server, media_id,
+    }) catch null;
+}
+
+/// Extract content_uri from Matrix upload response JSON.
+fn extractMxcUrl(allocator: std.mem.Allocator, resp: []const u8) ?[]u8 {
+    // Simple extraction: find "content_uri":"mxc://..."
+    const key = "\"content_uri\":\"";
+    const start = (std.mem.indexOf(u8, resp, key) orelse return null) + key.len;
+    const end = std.mem.indexOf(u8, resp[start..], "\"") orelse return null;
+    const uri = resp[start .. start + end];
+    if (!std.mem.startsWith(u8, uri, "mxc://")) return null;
+    return allocator.dupe(u8, uri) catch null;
+}
 
 fn stripTrailingSlashes(url: []const u8) []const u8 {
     var end = url.len;
@@ -910,4 +1087,140 @@ test "MatrixChannel parseSyncResponse with empty room_id accepts multiple rooms"
     }
     try std.testing.expect(saw_a);
     try std.testing.expect(saw_b);
+}
+
+test "mxcToHttpUrl converts valid mxc url" {
+    const allocator = std.testing.allocator;
+    const url = mxcToHttpUrl(allocator, "https://matrix.example", "mxc://matrix.org/abc123").?;
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://matrix.example/_matrix/media/v3/download/matrix.org/abc123",
+        url,
+    );
+}
+
+test "mxcToHttpUrl returns null for non-mxc url" {
+    try std.testing.expect(mxcToHttpUrl(std.testing.allocator, "https://matrix.example", "https://foo.com/bar") == null);
+}
+
+test "mxcToHttpUrl returns null for malformed mxc" {
+    try std.testing.expect(mxcToHttpUrl(std.testing.allocator, "https://matrix.example", "mxc://") == null);
+    try std.testing.expect(mxcToHttpUrl(std.testing.allocator, "https://matrix.example", "mxc://server") == null);
+    try std.testing.expect(mxcToHttpUrl(std.testing.allocator, "https://matrix.example", "mxc://server/") == null);
+}
+
+test "extractMxcUrl parses upload response" {
+    const allocator = std.testing.allocator;
+    const resp = "{\"content_uri\":\"mxc://matrix.org/uploaded123\"}";
+    const url = extractMxcUrl(allocator, resp).?;
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("mxc://matrix.org/uploaded123", url);
+}
+
+test "extractMxcUrl returns null for bad response" {
+    try std.testing.expect(extractMxcUrl(std.testing.allocator, "{}") == null);
+    try std.testing.expect(extractMxcUrl(std.testing.allocator, "{\"content_uri\":\"https://not-mxc\"}") == null);
+}
+
+test "MatrixChannel parseSyncResponse handles m.image messages" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "join": {
+        \\      "!room:example": {
+        \\        "timeline": {
+        \\          "events": [
+        \\            {
+        \\              "type": "m.room.message",
+        \\              "sender": "@alice:example",
+        \\              "event_id": "$img1",
+        \\              "origin_server_ts": 1700000000000,
+        \\              "content": {
+        \\                "msgtype": "m.image",
+        \\                "body": "photo.jpg",
+        \\                "url": "mxc://matrix.org/abc123"
+        \\              }
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    // In test mode, should contain the mxc URL tag
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "[IMAGE:mxc://matrix.org/abc123]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "photo.jpg") != null);
+}
+
+test "MatrixChannel parseSyncResponse handles m.file messages" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "join": {
+        \\      "!room:example": {
+        \\        "timeline": {
+        \\          "events": [
+        \\            {
+        \\              "type": "m.room.message",
+        \\              "sender": "@alice:example",
+        \\              "event_id": "$file1",
+        \\              "content": {
+        \\                "msgtype": "m.file",
+        \\                "body": "report.pdf",
+        \\                "url": "mxc://matrix.org/def456"
+        \\              }
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "[FILE:mxc://matrix.org/def456]") != null);
+}
+
+test "http_util guessContentType" {
+    const http_util = @import("../http_util.zig");
+    try std.testing.expectEqualStrings("image/png", http_util.guessContentType("photo.png"));
+    try std.testing.expectEqualStrings("image/jpeg", http_util.guessContentType("photo.jpg"));
+    try std.testing.expectEqualStrings("application/pdf", http_util.guessContentType("doc.pdf"));
+    try std.testing.expectEqualStrings("application/octet-stream", http_util.guessContentType("file.xyz"));
 }

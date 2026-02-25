@@ -285,9 +285,55 @@ pub const DiscordChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+
+        if (media.len > 0) {
+            // Send with file attachments via multipart form
+            for (media) |file_path| {
+                try self.sendFileMessage(target, message, file_path);
+            }
+            // If we sent media with the text, we're done
+            if (message.len > 0 and media.len > 0) return;
+        }
+
+        if (message.len > 0) {
+            try self.sendMessage(target, message);
+        }
+    }
+
+    /// Send a message with a file attachment via Discord multipart/form-data.
+    fn sendFileMessage(self: *DiscordChannel, channel_id: []const u8, text: []const u8, file_path: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        const url = try sendUrl(&url_buf, channel_id);
+
+        // Build auth header
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        // Build payload_json with content text
+        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload_buf.deinit(self.allocator);
+        const pw = payload_buf.writer(self.allocator);
+
+        if (text.len > 0) {
+            try pw.writeAll("{\"content\":");
+            try root.appendJsonStringW(pw, text);
+            try pw.writeAll("}");
+        } else {
+            try pw.writeAll("{}");
+        }
+
+        const http_util = @import("../http_util.zig");
+        const fields = [_]http_util.FormField{
+            .{ .name = "payload_json", .value = payload_buf.items },
+            .{ .name = "files[0]", .value = file_path, .is_file = true },
+        };
+
+        const resp = try http_util.curlPostMultipart(self.allocator, url, &fields, &.{auth_header});
+        self.allocator.free(resp);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
